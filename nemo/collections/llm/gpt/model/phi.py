@@ -15,49 +15,31 @@
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Callable, Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from nemo.collections.llm.gpt.model.base import GPTConfig, GPTModel
-from nemo.collections.llm.utils import Config
 from nemo.lightning import OptimizerModule, io, teardown
-from nemo.lightning.pytorch.utils import dtype_from_hf
-from nemo.utils import logging
-
-if TYPE_CHECKING:
-    from megatron.core.models.gpt.gpt_model import GPTModel as MCoreGPTModel
-    from transformers import Phi3Model, Phi3Config
-    from transformers import LlamaForCausalLM
-
-    from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
-    from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 
 @dataclass
 class Phi3Config(GPTConfig):
-    vocab_size: int = 32064
-    hidden_size: int = 3072
-    intermediate_size: int = 8192
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 32
-    num_key_value_heads: Optional[int] = None
-    resid_pdrop: float = 0.0
-    embd_pdrop: float = 0.0
+    normalization: str = "RMSNorm"
+    activation_func: Callable = F.silu
+    position_embedding_type: str = "rope"
+    add_bias_linear: bool = False
+    seq_length: int = 4096
     attention_dropout: float = 0.0
-    hidden_act: str = 'silu'
-    max_position_embeddings: int = 4096
-    original_max_position_embeddings: int = 4096
-    initializer_range: float = 0.02
-    rms_norm_eps: float = 1e-05
-    use_cache: bool = True
-    tie_word_embeddings: bool = False
-    rope_theta: float = 10000.0
-    rope_scaling: Optional[float] = None
-    bos_token_id: int = 1
-    eos_token_id: int = 32000
-    pad_token_id: int = 32000
+    hidden_dropout: float = 0.0
+    share_embeddings_and_output_weights: bool = False
+    num_layers: int = 32
+    hidden_size: int = 3072
+    ffn_hidden_size: int = 8192
+    num_attention_heads: int = 32
+    num_query_groups: int = 32
+    rotary_base: float = 10000.0
 
 class Phi3Model(GPTModel):
     def __init__(
@@ -70,27 +52,117 @@ class Phi3Model(GPTModel):
         super().__init__(config or Phi3Config(), optim=optim, tokenizer=tokenizer, model_transform=model_transform)
 
 @io.model_importer(Phi3Model, "hf")
-class HFPhi3Importer(io.ModelConnector["AutoModelForCausalLM", Phi3Model]):
+class HFPhi3Importer(io.ModelConnector["Phi3ForCausalLM", Phi3Model]):
     def init(self) -> Phi3Model:
         return Phi3Model(self.config, tokenizer=self.tokenizer)
 
-    def apply(self, output_path):
-        from transformers import AutoModelForCausalLM
+    def apply(self, output_path: Path) -> Path:
+        from transformers import Phi3ForCausalLM
 
-        source_model = AutoModelForCausalLM.from_pretrained(str(self), torch_dtype='auto')
-        target_model = self.init()
-        trainer = self.nemo_setup(target_model)
-        self.convert_state(source_model, target_model)
+        source = Phi3ForCausalLM.from_pretrained(str(self), torch_dtype='auto')
+        target = self.init()
+        trainer = self.nemo_setup(target)
+        self.convert_state(source, target)
         self.nemo_save(output_path, trainer)
 
-        print(f"Converted Phi-3 model to NeMo format, saved to {output_path}.")
+        print(f"Converted Phi3 model to Nemo, model saved to {output_path} in {source.dtype}.")
 
-        teardown(trainer, target_model)
-        del trainer, target_model
+        teardown(trainer, target)
+        del trainer, target
 
         return output_path
 
-__all__ = [
-    "Phi3Config",
-    "Phi3Model",
-]
+    def convert_state(self, source, target):
+        mapping = {
+            "model.embed_tokens.weight": "embedding.word_embeddings.weight",
+            "model.layers.*.self_attn.o_proj.weight": "decoder.layers.*.self_attention.linear_proj.weight",
+            "model.layers.*.mlp.down_proj.weight": "decoder.layers.*.mlp.linear_fc2.weight",
+            "model.layers.*.input_layernorm.weight": "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight",
+            "model.layers.*.post_attention_layernorm.weight": "decoder.layers.*.mlp.linear_fc1.layer_norm_weight",
+            "model.norm.weight": "decoder.final_layernorm.weight",
+            "lm_head.weight": "output_layer.weight",
+        }
+
+        return io.apply_transforms(source, target, mapping=mapping)
+
+    @property
+    def tokenizer(self):
+        from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
+
+        return AutoTokenizer(self.save_hf_tokenizer_assets(str(self)))
+
+    @property
+    def config(self) -> Phi3Config:
+        from transformers import Phi3Config as HFPhi3Config
+
+        source = HFPhi3Config.from_pretrained(str(self))
+
+        output = Phi3Config(
+            num_layers=source.num_hidden_layers,
+            hidden_size=source.hidden_size,
+            ffn_hidden_size=source.intermediate_size,
+            num_attention_heads=source.num_attention_heads,
+            rotary_base=source.rope_theta,
+            share_embeddings_and_output_weights=False,
+            params_dtype=torch.bfloat16 if source.torch_dtype == 'bfloat16' else torch.float16,
+        )
+
+        return output
+
+@io.model_exporter(Phi3Model, "hf")
+class HFPhi3Exporter(io.ModelConnector[Phi3Model, "Phi3ForCausalLM"]):
+    def init(self) -> "Phi3ForCausalLM":
+        from transformers import AutoModelForCausalLM
+
+        return AutoModelForCausalLM.from_config(self.config)
+
+    def apply(self, output_path: Path) -> Path:
+        target = self.init()
+        source, _ = self.nemo_load(str(self))
+        target = self.convert_state(source, target)
+
+        target.cpu().save_pretrained(output_path)
+        self.tokenizer.save_pretrained(output_path)
+
+        return output_path
+
+    def convert_state(self, source, target):
+        mapping = {
+            "embedding.word_embeddings.weight": "model.embed_tokens.weight",
+            "decoder.layers.*.self_attention.linear_proj.weight": "model.layers.*.self_attn.o_proj.weight",
+            "decoder.layers.*.mlp.linear_fc2.weight": "model.layers.*.mlp.down_proj.weight",
+            "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "model.layers.*.input_layernorm.weight",
+            "decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "model.layers.*.post_attention_layernorm.weight",
+            "decoder.final_layernorm.weight": "model.norm.weight",
+            "output_layer.weight": "lm_head.weight",
+        }
+
+        return io.apply_transforms(source, target, mapping=mapping)
+
+    @property
+    def tokenizer(self):
+        return io.load_context(str(self)).model.tokenizer.tokenizer
+
+    @property
+    def config(self) -> "HFPhi3Config":
+        source: Phi3Config = io.load_context(str(self)).model.config
+
+        from transformers import Phi3Config as HFPhi3Config
+
+        return HFPhi3Config(
+            num_hidden_layers=source.num_layers,
+            hidden_size=source.hidden_size,
+            intermediate_size=source.ffn_hidden_size,
+            num_attention_heads=source.num_attention_heads,
+            max_position_embeddings=source.seq_length,
+            initializer_range=0.02,
+            rms_norm_eps=1e-05,
+            num_key_value_heads=source.num_query_groups,
+            rope_theta=source.rotary_base,
+            vocab_size=self.tokenizer.vocab_size,
+        )
+    
+    __all__ = [
+        "Phi3Config",
+        "Phi3Model",
+    ]
