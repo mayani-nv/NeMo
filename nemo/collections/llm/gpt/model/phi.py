@@ -23,6 +23,8 @@ from torch import nn
 
 from nemo.collections.llm.gpt.model.base import GPTConfig, GPTModel
 from nemo.lightning import OptimizerModule, io, teardown
+from nemo.lightning.pytorch.utils import dtype_from_hf
+from nemo.utils import logging
 
 @dataclass
 class Phi3Config(GPTConfig):
@@ -89,7 +91,7 @@ class HFPhi3Importer(io.ModelConnector["Phi3ForCausalLM", Phi3Model]):
             "model.layers.*.input_layernorm.weight": "module.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight",
             "model.layers.*.post_attention_layernorm.weight": "module.decoder.layers.*.mlp.linear_fc1.layer_norm_weight",
             "model.norm.weight": "module.decoder.final_layernorm.weight",
-            "model.lm_head.weight": "module.output_layer.weight",
+            "lm_head.weight": "module.output_layer.weight",
         }
 
         # Print keys for debugging
@@ -97,6 +99,12 @@ class HFPhi3Importer(io.ModelConnector["Phi3ForCausalLM", Phi3Model]):
         target_keys_layers_0 = [key for key in target.state_dict().keys() if key.startswith("module.decoder.layers.0.")]
         print("Source state dict keys:", source_keys_layers_0)
         print("Target state dict keys:", target_keys_layers_0)
+
+        # Print keys not associated with layers.0
+        source_keys_non_layers_0 = [key for key in source.state_dict().keys() if not key.startswith("model.layers.")]
+        target_keys_non_layers_0 = [key for key in target.state_dict().keys() if not key.startswith("module.decoder.layers.")]
+        print("Source state dict keys (non-layers.0):", source_keys_non_layers_0)
+        print("Target state dict keys (non-layers.0):", target_keys_non_layers_0)
 
         # Check dimensions and existence
         for src_key, tgt_key in mapping.items():
@@ -139,14 +147,26 @@ class HFPhi3Importer(io.ModelConnector["Phi3ForCausalLM", Phi3Model]):
 
         source = HFPhi3Config.from_pretrained(str(self))
 
+        def make_vocab_size_divisible_by(vocab_size):
+            base = 128
+            while vocab_size % base != 0:
+                base //= 2
+            return base
+
         output = Phi3Config(
             num_layers=source.num_hidden_layers,
             hidden_size=source.hidden_size,
             ffn_hidden_size=source.intermediate_size,
             num_attention_heads=source.num_attention_heads,
+            init_method_std=source.initializer_range,
+            layernorm_epsilon=source.rms_norm_eps,
             rotary_base=source.rope_theta,
+            gated_linear_unit=True,
+            make_vocab_size_divisible_by=make_vocab_size_divisible_by(source.vocab_size),
             share_embeddings_and_output_weights=False,
-            params_dtype=torch.bfloat16 if source.torch_dtype == 'bfloat16' else torch.float16,
+            fp16=(dtype_from_hf(source) == torch.float16),
+            bf16=(dtype_from_hf(source) == torch.bfloat16),
+            params_dtype=dtype_from_hf(source),
         )
 
         return output
