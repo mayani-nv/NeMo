@@ -28,6 +28,7 @@ from nemo.lightning import OptimizerModule, io, teardown
 class Phi3Config(GPTConfig):
     normalization: str = "RMSNorm"
     activation_func: Callable = F.silu
+    gated_linear_unit: bool = True
     position_embedding_type: str = "rope"
     add_bias_linear: bool = False
     seq_length: int = 4096
@@ -40,6 +41,7 @@ class Phi3Config(GPTConfig):
     num_attention_heads: int = 32
     num_query_groups: int = 32
     rotary_base: float = 10000.0
+    vocab_size: int = 32064
 
 class Phi3Model(GPTModel):
     def __init__(
@@ -59,7 +61,12 @@ class HFPhi3Importer(io.ModelConnector["Phi3ForCausalLM", Phi3Model]):
     def apply(self, output_path: Path) -> Path:
         from transformers import Phi3ForCausalLM
 
-        source = Phi3ForCausalLM.from_pretrained(str(self), torch_dtype='auto')
+        # Check if the source is valid model identifier or path
+        try:
+            source = Phi3ForCausalLM.from_pretrained(str(self), torch_dtype='auto')
+        except Exception as e:
+            raise ValueError(f"Failed to load the model from source '{self}': {e}")
+        
         target = self.init()
         trainer = self.nemo_setup(target)
         self.convert_state(source, target)
@@ -74,16 +81,51 @@ class HFPhi3Importer(io.ModelConnector["Phi3ForCausalLM", Phi3Model]):
 
     def convert_state(self, source, target):
         mapping = {
-            "model.embed_tokens.weight": "embedding.word_embeddings.weight",
-            "model.layers.*.self_attn.o_proj.weight": "decoder.layers.*.self_attention.linear_proj.weight",
-            "model.layers.*.mlp.down_proj.weight": "decoder.layers.*.mlp.linear_fc2.weight",
-            "model.layers.*.input_layernorm.weight": "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight",
-            "model.layers.*.post_attention_layernorm.weight": "decoder.layers.*.mlp.linear_fc1.layer_norm_weight",
-            "model.norm.weight": "decoder.final_layernorm.weight",
-            "lm_head.weight": "output_layer.weight",
+            "model.embed_tokens.weight": "module.embedding.word_embeddings.weight",
+            "model.layers.*.self_attn.o_proj.weight": "module.decoder.layers.*.self_attention.linear_proj.weight",
+            "model.layers.*.self_attn.qkv_proj.weight": "module.decoder.layers.*.self_attention.linear_qkv.weight",
+            "model.layers.*.mlp.gate_up_proj.weight": "module.decoder.layers.*.mlp.linear_fc1.weight",
+            "model.layers.*.mlp.down_proj.weight": "module.decoder.layers.*.mlp.linear_fc2.weight",
+            "model.layers.*.input_layernorm.weight": "module.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight",
+            "model.layers.*.post_attention_layernorm.weight": "module.decoder.layers.*.mlp.linear_fc1.layer_norm_weight",
+            "model.norm.weight": "module.decoder.final_layernorm.weight",
+            "model.lm_head.weight": "module.output_layer.weight",
         }
 
+        # Print keys for debugging
+        source_keys_layers_0 = [key for key in source.state_dict().keys() if key.startswith("model.layers.0.")]
+        target_keys_layers_0 = [key for key in target.state_dict().keys() if key.startswith("module.decoder.layers.0.")]
+        print("Source state dict keys:", source_keys_layers_0)
+        print("Target state dict keys:", target_keys_layers_0)
+
+        # Check dimensions and existence
+        for src_key, tgt_key in mapping.items():
+            src_key_specific = src_key.replace('*', '0')
+            tgt_key_specific = tgt_key.replace('*', '0')
+
+            try:
+                if src_key_specific in source.state_dict():
+                    src_shape = source.state_dict()[src_key_specific].shape
+                    print(f"Source shape for {src_key_specific}: {src_shape}")
+                else:
+                    print(f"Source key not found: {src_key_specific}")
+
+                if tgt_key_specific in target.state_dict():
+                    tgt_shape = target.state_dict()[tgt_key_specific].shape
+                    print(f"Target shape for {tgt_key_specific}: {tgt_shape}")
+                else:
+                    print(f"Target key not found: {tgt_key_specific}")
+
+                if src_shape != tgt_shape:
+                    print(f"Shape mismatch for {src_key_specific} -> {tgt_key_specific}: {src_shape} vs {tgt_shape}")
+                else:
+                    print(f"Shapes match for {src_key_specific} -> {tgt_key_specific}")
+
+            except Exception as e:
+                print(f"Error checking shapes for {src_key_specific} -> {tgt_key_specific}: {e}")
+
         return io.apply_transforms(source, target, mapping=mapping)
+
 
     @property
     def tokenizer(self):
@@ -137,6 +179,11 @@ class HFPhi3Exporter(io.ModelConnector[Phi3Model, "Phi3ForCausalLM"]):
             "output_layer.weight": "lm_head.weight",
         }
 
+        # Convert source weights to target dtype if needed
+        for name, param in source.state_dict().items():
+            if param.dtype != target.state_dict()[name].dtype:
+                param.data = param.data.to(target.state_dict()[name].dtype)
+
         return io.apply_transforms(source, target, mapping=mapping)
 
     @property
@@ -164,5 +211,5 @@ class HFPhi3Exporter(io.ModelConnector[Phi3Model, "Phi3ForCausalLM"]):
     
     __all__ = [
         "Phi3Config",
-        "Phi3Model",
+        "Phi3Model"
     ]
