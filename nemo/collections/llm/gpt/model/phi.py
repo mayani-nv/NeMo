@@ -83,15 +83,15 @@ class HFPhi3Importer(io.ModelConnector["Phi3ForCausalLM", Phi3Model]):
 
     def convert_state(self, source, target):
         mapping = {
-            "model.embed_tokens.weight": "module.embedding.word_embeddings.weight",
-            "model.layers.*.self_attn.o_proj.weight": "module.decoder.layers.*.self_attention.linear_proj.weight",
-            "model.layers.*.self_attn.qkv_proj.weight": "module.decoder.layers.*.self_attention.linear_qkv.weight",
-            "model.layers.*.mlp.gate_up_proj.weight": "module.decoder.layers.*.mlp.linear_fc1.weight",
-            "model.layers.*.mlp.down_proj.weight": "module.decoder.layers.*.mlp.linear_fc2.weight",
-            "model.layers.*.input_layernorm.weight": "module.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight",
-            "model.layers.*.post_attention_layernorm.weight": "module.decoder.layers.*.mlp.linear_fc1.layer_norm_weight",
-            "model.norm.weight": "module.decoder.final_layernorm.weight",
-            "lm_head.weight": "module.output_layer.weight",
+            "model.embed_tokens.weight": "embedding.word_embeddings.weight",
+            "model.layers.*.self_attn.o_proj.weight": "decoder.layers.*.self_attention.linear_proj.weight",
+            "model.layers.*.self_attn.qkv_proj.weight": "decoder.layers.*.self_attention.linear_qkv.weight",
+            "model.layers.*.mlp.gate_up_proj.weight": "decoder.layers.*.mlp.linear_fc1.weight",
+            "model.layers.*.mlp.down_proj.weight": "decoder.layers.*.mlp.linear_fc2.weight",
+            "model.layers.*.input_layernorm.weight": "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight",
+            "model.layers.*.post_attention_layernorm.weight": "decoder.layers.*.mlp.linear_fc1.layer_norm_weight",
+            "model.norm.weight": "decoder.final_layernorm.weight",
+            "lm_head.weight": "output_layer.weight",
         }
 
         # Print keys for debugging
@@ -132,9 +132,9 @@ class HFPhi3Importer(io.ModelConnector["Phi3ForCausalLM", Phi3Model]):
             except Exception as e:
                 print(f"Error checking shapes for {src_key_specific} -> {tgt_key_specific}: {e}")
 
-        return io.apply_transforms(source, target, mapping=mapping)
+        return io.apply_transforms(source, target, mapping=mapping, transforms=[_import_qkv, _import_linear_fc1])
 
-
+   
     @property
     def tokenizer(self):
         from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
@@ -229,7 +229,55 @@ class HFPhi3Exporter(io.ModelConnector[Phi3Model, "Phi3ForCausalLM"]):
             vocab_size=self.tokenizer.vocab_size,
         )
     
-    __all__ = [
-        "Phi3Config",
-        "Phi3Model"
-    ]
+@io.state_transform(
+    source_key=(
+        "model.layers.*.self_attn.q_proj.weight",
+        "model.layers.*.self_attn.k_proj.weight",
+        "model.layers.*.self_attn.v_proj.weight",
+    ),
+    target_key="decoder.layers.*.self_attention.linear_qkv.weight",
+)
+def _import_qkv(ctx: io.TransformCTX, q, k, v):
+    megatron_config = ctx.target.config
+
+    head_num = megatron_config.num_attention_heads
+    num_query_groups = megatron_config.num_query_groups
+    heads_per_group = head_num // num_query_groups
+    hidden_size = megatron_config.hidden_size
+    head_size = megatron_config.kv_channels
+
+    old_tensor_shape = q.size()
+    new_q_tensor_shape = (head_num, head_size) + old_tensor_shape[1:]
+    new_kv_tensor_shape = (num_query_groups, head_size) + old_tensor_shape[1:]
+
+    q = q.view(*new_q_tensor_shape)
+    k = k.view(*new_kv_tensor_shape)
+    v = v.view(*new_kv_tensor_shape)
+
+    qkv_weights_l = []
+    for i in range(num_query_groups):
+        qkv_weights_l.append(q[i * heads_per_group : (i + 1) * heads_per_group, :, :])
+        qkv_weights_l.append(k[i : i + 1, :, :])
+        qkv_weights_l.append(v[i : i + 1, :, :])
+    qkv_weights = torch.cat(qkv_weights_l)
+    assert qkv_weights.ndim == 3, qkv_weights.shape
+    assert qkv_weights.shape[0] == (heads_per_group + 2) * num_query_groups, qkv_weights.shape
+    assert qkv_weights.shape[1] == head_size, qkv_weights.shape
+    assert qkv_weights.shape[2] == old_tensor_shape[1], qkv_weights.shape
+
+    qkv_weights = qkv_weights.reshape([head_size * (head_num + 2 * num_query_groups), hidden_size])
+
+    return qkv_weights
+
+@io.state_transform(
+    source_key=("model.layers.*.mlp.gate_proj.weight", "model.layers.*.mlp.up_proj.weight"),
+    target_key="decoder.layers.*.mlp.linear_fc1.weight",
+)
+def _import_linear_fc1(down, gate):
+    return torch.cat((down, gate), axis=0)
+
+
+__all__ = [
+    "Phi3Config",
+    "Phi3Model"
+]
