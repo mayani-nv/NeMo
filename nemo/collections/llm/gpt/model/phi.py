@@ -94,44 +94,6 @@ class HFPhi3Importer(io.ModelConnector["Phi3ForCausalLM", Phi3Model]):
             "lm_head.weight": "output_layer.weight",
         }
 
-        # Print keys for debugging
-        source_keys_layers_0 = [key for key in source.state_dict().keys() if key.startswith("model.layers.0.")]
-        target_keys_layers_0 = [key for key in target.state_dict().keys() if key.startswith("module.decoder.layers.0.")]
-        print("Source state dict keys:", source_keys_layers_0)
-        print("Target state dict keys:", target_keys_layers_0)
-
-        # Print keys not associated with layers.0
-        source_keys_non_layers_0 = [key for key in source.state_dict().keys() if not key.startswith("model.layers.")]
-        target_keys_non_layers_0 = [key for key in target.state_dict().keys() if not key.startswith("module.decoder.layers.")]
-        print("Source state dict keys (non-layers.0):", source_keys_non_layers_0)
-        print("Target state dict keys (non-layers.0):", target_keys_non_layers_0)
-
-        # Check dimensions and existence
-        for src_key, tgt_key in mapping.items():
-            src_key_specific = src_key.replace('*', '0')
-            tgt_key_specific = tgt_key.replace('*', '0')
-
-            try:
-                if src_key_specific in source.state_dict():
-                    src_shape = source.state_dict()[src_key_specific].shape
-                    print(f"Source shape for {src_key_specific}: {src_shape}")
-                else:
-                    print(f"Source key not found: {src_key_specific}")
-
-                if tgt_key_specific in target.state_dict():
-                    tgt_shape = target.state_dict()[tgt_key_specific].shape
-                    print(f"Target shape for {tgt_key_specific}: {tgt_shape}")
-                else:
-                    print(f"Target key not found: {tgt_key_specific}")
-
-                if src_shape != tgt_shape:
-                    print(f"Shape mismatch for {src_key_specific} -> {tgt_key_specific}: {src_shape} vs {tgt_shape}")
-                else:
-                    print(f"Shapes match for {src_key_specific} -> {tgt_key_specific}")
-
-            except Exception as e:
-                print(f"Error checking shapes for {src_key_specific} -> {tgt_key_specific}: {e}")
-
         return io.apply_transforms(source, target, mapping=mapping, transforms=[_import_qkv, _import_linear_fc1])
 
    
@@ -229,37 +191,35 @@ class HFPhi3Exporter(io.ModelConnector[Phi3Model, "Phi3ForCausalLM"]):
             vocab_size=self.tokenizer.vocab_size,
         )
     
-@io.state_transform(
-    source_key=(
-        "model.layers.*.self_attn.q_proj.weight",
-        "model.layers.*.self_attn.k_proj.weight",
-        "model.layers.*.self_attn.v_proj.weight",
-    ),
-    target_key="decoder.layers.*.self_attention.linear_qkv.weight",
-)
-def _import_qkv(ctx: io.TransformCTX, q, k, v):
-    megatron_config = ctx.target.config
 
+@io.state_transform(
+   source_key="model.layers.*.self_attn.qkv_proj.weight",
+   target_key="decoder.layers.*.self_attention.linear_qkv.weight",
+)
+def _import_qkv(ctx: io.TransformCTX, qkv_weight):
+    megatron_config = ctx.target.config
+   
     head_num = megatron_config.num_attention_heads
     num_query_groups = megatron_config.num_query_groups
-    heads_per_group = head_num // num_query_groups
+    heads_per_group = head_num //  num_query_groups
     hidden_size = megatron_config.hidden_size
     head_size = megatron_config.kv_channels
 
-    old_tensor_shape = q.size()
-    new_q_tensor_shape = (head_num, head_size) + old_tensor_shape[1:]
-    new_kv_tensor_shape = (num_query_groups, head_size) + old_tensor_shape[1:]
-
+    old_tensor_shape = qkv_weight.size()
+    new_q_tensor_shape = (head_num, head_size, old_tensor_shape[1])
+    new_kv_tensor_shape = (num_query_groups, head_size, old_tensor_shape[1])
+    q, k, v = qkv_weight.split(
+        [head_num * head_size, num_query_groups * head_size, num_query_groups * head_size], dim=0
+    )
     q = q.view(*new_q_tensor_shape)
     k = k.view(*new_kv_tensor_shape)
     v = v.view(*new_kv_tensor_shape)
 
-    qkv_weights_l = []
+    qkv_weights = torch.empty((0, head_size, old_tensor_shape[1])).type_as(qkv_weight)
     for i in range(num_query_groups):
-        qkv_weights_l.append(q[i * heads_per_group : (i + 1) * heads_per_group, :, :])
-        qkv_weights_l.append(k[i : i + 1, :, :])
-        qkv_weights_l.append(v[i : i + 1, :, :])
-    qkv_weights = torch.cat(qkv_weights_l)
+        qkv_weights = torch.cat((qkv_weights, q[i * heads_per_group : (i + 1) * heads_per_group, :, :]))
+        qkv_weights = torch.cat((qkv_weights, k[i : i + 1, :, :]))
+        qkv_weights = torch.cat((qkv_weights, v[i : i + 1, :, :]))
     assert qkv_weights.ndim == 3, qkv_weights.shape
     assert qkv_weights.shape[0] == (heads_per_group + 2) * num_query_groups, qkv_weights.shape
     assert qkv_weights.shape[1] == head_size, qkv_weights.shape
@@ -268,6 +228,7 @@ def _import_qkv(ctx: io.TransformCTX, q, k, v):
     qkv_weights = qkv_weights.reshape([head_size * (head_num + 2 * num_query_groups), hidden_size])
 
     return qkv_weights
+
 
 @io.state_transform(
     source_key=("model.layers.*.mlp.gate_proj.weight", "model.layers.*.mlp.up_proj.weight"),
