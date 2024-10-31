@@ -37,6 +37,10 @@ class Phi3Config(GPTConfig):
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
     share_embeddings_and_output_weights: bool = False
+    
+
+@dataclass
+class Phi3Config4B(Phi3Config):
     num_layers: int = 32
     hidden_size: int = 3072
     ffn_hidden_size: int = 8192
@@ -44,6 +48,20 @@ class Phi3Config(GPTConfig):
     num_query_groups: int = 32
     rotary_base: float = 10000.0
     vocab_size: int = 32064
+
+@dataclass
+class Phi3Config8B(Phi3Config):
+    num_layers: int = 32
+    hidden_size: int = 4096
+    ffn_hidden_size: int =  14336
+    num_attention_heads: int = 32
+    num_query_groups: int = 8
+    rotary_base: float = 10000.0
+    vocab_size: int = 100352
+    layernorm_epsilon: float = 1.0e-05
+    initializer_range: float =  0.02
+    max_position_embeddings: int = 8192
+
 
 class Phi3Model(GPTModel):
     def __init__(
@@ -240,5 +258,7 @@ def _import_linear_fc1(down, gate):
 
 __all__ = [
     "Phi3Config",
+    "Phi3Config4B",
+    "Phi3Config8B",
     "Phi3Model"
 ]
