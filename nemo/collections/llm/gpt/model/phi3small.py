@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class Phi3Config(GPTConfig):
-    normalization: str = "RMSNorm"
+    normalization: str = "LayerNorm"
     activation_func: Callable = F.gelu
     gated_linear_unit: bool = True
     position_embedding_type: str = "rope"
@@ -52,7 +52,7 @@ class Phi3ConfigSmall(Phi3Config):
     ffn_hidden_size: int =  14336
     num_attention_heads: int = 32
     num_query_groups: int = 8
-    rotary_base: float = 10000.0
+    rotary_base:float = 1000000
     vocab_size: int = 100352
     layernorm_epsilon: float = 1.0e-05
     initializer_range: float =  0.02
@@ -81,7 +81,7 @@ class HFPhi3Importer(io.ModelConnector["AutoModelForCausalLM", Phi3Model]):
     
 
     def apply(self, output_path: Path) -> Path:
-        from transformers import Phi3ForCausalLM, AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM
 
         # Check if the source is valid model identifier or path
         try:
@@ -113,15 +113,15 @@ class HFPhi3Importer(io.ModelConnector["AutoModelForCausalLM", Phi3Model]):
             "model.final_layernorm.weight": "decoder.final_layernorm.weight",
             "lm_head.weight": "output_layer.weight",
 
-            # # bias related mapping
-            # "model.layers.*.self_attn_query_key_value.bias": "decoder.layers.*.self_attention.linear_qkv.bias",
-            # "model.layers.*.self_attn.dense.bias": "decoder.layers.*.self_attention.linear_proj.bias",
-            # # "model.layers.*.self_attn.rotary_emb.inv_freq":  #this can be ignored
-            # "model.layers.*.mlp.up_proj.bias":"decoder.layers.*.mlp.linear_fc1.bias",
-            # "model.layers.*.mlp.down_proj.bias":"decoder.layers.*.mlp.linear_fc2.bias",
-            # "model.layers.*.input_layernorm.bias": "decoder.layers.*.self_attention.linear_qkv.layer_norm_bias" ,
-            # "model.layers.*.post_attention_layernorm.bias": "decoder.layers.*.mlp.linear_fc1.layer_norm_bias",
-            # "model.final_layernorm.bias": "decoder.final_layernorm.bias",
+            # bias related mapping
+            "model.layers.*.self_attn.query_key_value.bias": "decoder.layers.*.self_attention.linear_qkv.bias",
+            "model.layers.*.self_attn.dense.bias": "decoder.layers.*.self_attention.linear_proj.bias",
+            # "model.layers.*.self_attn.rotary_emb.inv_freq":  #this can be ignored
+            "model.layers.*.mlp.up_proj.bias":"decoder.layers.*.mlp.linear_fc1.bias",
+            "model.layers.*.mlp.down_proj.bias":"decoder.layers.*.mlp.linear_fc2.bias",
+            "model.layers.*.input_layernorm.bias": "decoder.layers.*.self_attention.linear_qkv.layer_norm_bias" ,
+            "model.layers.*.post_attention_layernorm.bias": "decoder.layers.*.mlp.linear_fc1.layer_norm_bias",
+            "model.final_layernorm.bias": "decoder.final_layernorm.bias",
         }
         return io.apply_transforms(source, target, mapping=mapping, transforms=[_import_qkv, _import_qkv_bias, _import_linear_fc1])
     
